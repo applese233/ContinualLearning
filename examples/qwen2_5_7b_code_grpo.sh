@@ -8,7 +8,7 @@ source "${ROOT_DIR}/examples/qwen2_5_7b_stage_common.sh"
 
 # Editable defaults
 DATA_DIR="${DATA_DIR:-${ROOT_DIR}/data/two_stage_grpo}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen2_5_7b_math_grpo}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen2_5_7b_code_grpo}"
 MODEL_PATH="${MODEL_PATH:-}"
 BASE_MODEL_PATH="${BASE_MODEL_PATH:-${MODEL_PATH}}"
 PREV_STAGE_EXPERIMENT_NAME="${PREV_STAGE_EXPERIMENT_NAME:-}"
@@ -36,13 +36,14 @@ MICRO_BATCH_SIZE_EXPERIENCE="${MICRO_BATCH_SIZE_EXPERIENCE:-4}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.8}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1536}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-1024}"
-ACTOR_LR="${ACTOR_LR:-1.0e-6}"
+ACTOR_LR="${ACTOR_LR:-5.0e-7}"
 
 # Eval dataset limits loaded at runtime. Leave empty for full datasets.
-PRIMARY_VAL_LIMIT="${PRIMARY_VAL_LIMIT:-200}"
-AIME25_VAL_LIMIT="${AIME25_VAL_LIMIT:-30}"
-MBPP_VAL_LIMIT="${MBPP_VAL_LIMIT:-32}"
+PRIMARY_VAL_LIMIT="${PRIMARY_VAL_LIMIT:-32}"
+APPS_VAL_LIMIT="${APPS_VAL_LIMIT:-32}"
+HUMANEVAL_VAL_LIMIT="${HUMANEVAL_VAL_LIMIT:-32}"
 LIVECODEBENCH_VAL_LIMIT="${LIVECODEBENCH_VAL_LIMIT:-32}"
+AIME25_VAL_LIMIT="${AIME25_VAL_LIMIT:-30}"
 
 # Add raw OmegaConf CLI args here if needed, for example:
 # EXTRA_ARGS=("trainer.val_before_train=false" "worker.rollout.n=2")
@@ -57,7 +58,7 @@ fi
 BASE_MODEL_PATH=$(resolve_base_model_path "${BASE_MODEL_PATH}" "${PREV_STAGE_EXPERIMENT_NAME}" "${PREV_STAGE_CHECKPOINT_ROOT}" "${CHECKPOINT_SELECTION}" "${PROJECT_NAME}")
 
 TRAIN_ARGS=(
-    "config=${ROOT_DIR}/examples/configs/qwen2_5_7b_stage1_math_grpo.yaml"
+    "config=${ROOT_DIR}/examples/configs/qwen2_5_7b_stage2_code_grpo.yaml"
     "worker.actor.model.model_path=${BASE_MODEL_PATH}"
     "trainer.experiment_name=${EXPERIMENT_NAME}"
     "trainer.project_name=${PROJECT_NAME}"
@@ -87,7 +88,8 @@ TRAIN_ARGS+=("${EXTRA_ARGS[@]}")
 
 DATA_DIR="${DATA_DIR}" \
 PRIMARY_VAL_LIMIT="${PRIMARY_VAL_LIMIT}" \
-AIME25_VAL_LIMIT="${AIME25_VAL_LIMIT}" \
-MBPP_VAL_LIMIT="${MBPP_VAL_LIMIT}" \
+APPS_VAL_LIMIT="${APPS_VAL_LIMIT}" \
+HUMANEVAL_VAL_LIMIT="${HUMANEVAL_VAL_LIMIT}" \
 LIVECODEBENCH_VAL_LIMIT="${LIVECODEBENCH_VAL_LIMIT}" \
+AIME25_VAL_LIMIT="${AIME25_VAL_LIMIT}" \
 python3 -m verl.trainer.main "${TRAIN_ARGS[@]}"

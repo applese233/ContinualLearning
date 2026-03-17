@@ -27,15 +27,50 @@ def recursive_post_init(dataclass_obj):
     if hasattr(dataclass_obj, "post_init"):
         dataclass_obj.post_init()
 
+    if not is_dataclass(dataclass_obj):
+        return
+
     for attr in fields(dataclass_obj):
-        if is_dataclass(getattr(dataclass_obj, attr.name)):
-            recursive_post_init(getattr(dataclass_obj, attr.name))
+        value = getattr(dataclass_obj, attr.name)
+        if is_dataclass(value):
+            recursive_post_init(value)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if is_dataclass(item):
+                    recursive_post_init(item)
+
+
+@dataclass
+class ValidationConfig:
+    name: str = "validation"
+    val_files: str = ""
+    val_limit: Optional[int] = None
+    prompt_key: Optional[str] = None
+    answer_key: Optional[str] = None
+    image_key: Optional[str] = None
+    video_key: Optional[str] = None
+    image_dir: Optional[str] = None
+    video_fps: Optional[float] = None
+    max_prompt_length: Optional[int] = None
+    val_batch_size: Optional[int] = None
+    format_prompt: Optional[str] = None
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    filter_overlong_prompts: Optional[bool] = None
+    filter_overlong_prompts_workers: Optional[int] = None
+    reward_function: Optional[str] = None
+    reward_function_kwargs: dict = field(default_factory=dict)
+
+    def post_init(self):
+        self.image_dir = get_abs_path(self.image_dir, prompt="Image directory")
+        self.format_prompt = get_abs_path(self.format_prompt, prompt="Format prompt file")
 
 
 @dataclass
 class DataConfig:
     train_files: str = ""
     val_files: str = ""
+    val_limit: Optional[int] = None
     prompt_key: str = "prompt"
     answer_key: str = "answer"
     image_key: str = "images"
@@ -120,6 +155,8 @@ class TrainerConfig:
     """validate before training"""
     val_only: bool = False
     """validate only, skip training"""
+    primary_val_name: str = "validation"
+    """display name for the primary validation dataset"""
     val_generations_to_log: int = 0
     """number of generations to log for validation"""
     save_freq: int = -1
@@ -151,6 +188,7 @@ class PPOConfig:
     worker: WorkerConfig = field(default_factory=WorkerConfig)
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
+    evaluations: list[ValidationConfig] = field(default_factory=list)
 
     def post_init(self):
         self.worker.rollout.prompt_length = self.data.max_prompt_length

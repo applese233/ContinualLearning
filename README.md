@@ -87,6 +87,59 @@ cd EasyR1
 pip install -e .
 ```
 
+The command above is sufficient only if your current Python environment already contains a compatible stack for PyTorch, vLLM, FlashAttention and Transformers. For RL training, especially for custom GRPO workflows, we strongly recommend using a clean environment.
+
+### Installation Without Docker or Apptainer
+
+You do not need `sudo` to run EasyR1. A user-local Conda environment is enough if your machine already has a working NVIDIA driver and CUDA runtime.
+
+1. Create and activate a clean Conda environment.
+
+```bash
+conda create -n easyr1 python=3.10 -y
+conda activate easyr1
+python -m pip install --upgrade pip setuptools wheel
+```
+
+2. Install EasyR1 directly.
+
+`requirements.txt` is pinned to a coherent runtime stack, so a fresh environment can install the project directly:
+
+```bash
+pip install -e .
+```
+
+3. Verify the runtime before starting training.
+
+```bash
+python -c "import torch, transformers, vllm; print(torch.__version__, transformers.__version__, vllm.__version__)"
+python -c "import flash_attn; print('flash-attn ok')"
+```
+
+4. Prepare your datasets and launch training.
+
+```bash
+python scripts/prepare_two_stage_datasets.py --output_dir data/two_stage_grpo
+bash examples/qwen2_5_7b_two_stage_grpo.sh
+```
+
+Alternative stage schedules use the same training configs and only change stage orchestration:
+
+```bash
+STAGE_SEQUENCE=code,math bash examples/qwen2_5_7b_multi_stage_grpo.sh
+STAGE_SEQUENCE=math,code,math bash examples/qwen2_5_7b_multi_stage_grpo.sh
+BASE_MODEL_PATH=/path/to/hf_model bash examples/qwen2_5_7b_code_grpo.sh
+STAGE1_TOTAL_EPOCHS=1 STAGE2_TOTAL_EPOCHS=3 STAGE2_ACTOR_LR=3.0e-7 bash examples/qwen2_5_7b_multi_stage_grpo.sh
+```
+
+For multi-stage runs, the launcher also accepts stage-specific overrides using the `STAGE{n}_...` pattern. For example, `STAGE2_MAX_RESPONSE_LENGTH=1024` only affects the second stage, while `TOTAL_EPOCHS=2` still acts as a global fallback for stages that do not define a stage-specific override.
+
+Notes:
+
+- If `flash-attn` fails to compile, the usual blocker is the local CUDA toolchain, not missing `sudo` privileges. In that case, keep the same Conda environment and retry with `pip install flash-attn==2.8.2 --no-build-isolation`.
+- If `vllm` import fails, first check the installed `transformers` version. Mismatched `vllm` and `transformers` versions are a common cause of startup failures.
+- Avoid reusing a large existing base environment with unrelated packages. Dependency drift is the most common reason for EasyR1 import errors.
+
 ### GRPO Full Training
 
 ```bash

@@ -172,6 +172,8 @@ class RayPPOTrainer:
         ray_worker_group_cls: Type[RayWorkerGroup] = RayWorkerGroup,
         reward_fn: Optional[AutoRewardManager] = None,
         val_reward_fn: Optional[AutoRewardManager] = None,
+        extra_val_dataloaders: Optional[dict[str, StatefulDataLoader]] = None,
+        extra_val_reward_fns: Optional[dict[str, AutoRewardManager]] = None,
     ):
         self.tokenizer = tokenizer
         self.processor = processor
@@ -180,6 +182,15 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.extra_val_dataloaders = extra_val_dataloaders or {}
+        self.extra_val_reward_fns = extra_val_reward_fns or {}
+        self.primary_val_name = config.trainer.primary_val_name
+
+        if self.primary_val_name in self.extra_val_dataloaders:
+            raise ValueError(f"Duplicate validation name: `{self.primary_val_name}` is reserved for the primary set.")
+
+        if set(self.extra_val_dataloaders) != set(self.extra_val_reward_fns):
+            raise ValueError("Extra validation dataloaders and reward functions must share the same names.")
 
         self.val_reward_score = 0.0
         self.best_val_reward_score = -1.0
@@ -389,15 +400,23 @@ class RayPPOTrainer:
         samples = samples[: self.config.trainer.val_generations_to_log]
         self.logger.log_generation(samples, self.global_step)
 
-    def _validate(self) -> dict[str, Any]:
+    def _validate_single(
+        self,
+        val_name: str,
+        val_dataloader: StatefulDataLoader,
+        reward_fn: AutoRewardManager,
+        metric_prefix: str,
+        log_generations: bool = False,
+        legacy_format: bool = False,
+    ) -> tuple[dict[str, Any], float]:
         reward_tensor_lst = []
         # Lists to collect samples for the table
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
         reward_metrics_lst = defaultdict(list)
         length_metrics_lst = defaultdict(list)
-        print("Start validation...")
+        print(f"Start validation ({val_name})...")
         self.actor_rollout_ref_wg.prepare_rollout_engine()
-        for batch_dict in self.val_dataloader:
+        for batch_dict in val_dataloader:
             test_batch = DataProto.from_single_dict(batch_dict)
             test_gen_batch = test_batch.pop(
                 batch_keys=["input_ids", "attention_mask", "position_ids"],
@@ -418,7 +437,7 @@ class RayPPOTrainer:
             test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
-            reward_tensor, reward_metrics = ray.get(self.val_reward_fn.compute_reward.remote(test_batch))
+            reward_tensor, reward_metrics = ray.get(reward_fn.compute_reward.remote(test_batch))
 
             # store generations
             input_ids = test_batch.batch["prompts"]
@@ -439,12 +458,75 @@ class RayPPOTrainer:
                 length_metrics_lst[key].append(value)
 
         self.actor_rollout_ref_wg.release_rollout_engine()
-        self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
-        self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
-        val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
-        val_length_metrics = {f"val_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
-        print("Finish validation.")
-        return {"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics}
+        if log_generations:
+            self._maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
+
+        val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
+        reward_metrics = reduce_metrics(reward_metrics_lst)
+        length_metrics = reduce_metrics(length_metrics_lst)
+        print(f"Finish validation ({val_name}).")
+
+        if legacy_format:
+            metrics = {"val/reward_score": val_reward_score}
+            metrics.update({f"val/{key}_reward": value for key, value in reward_metrics.items()})
+            metrics.update({f"val_{key}": value for key, value in length_metrics.items()})
+            return metrics, val_reward_score
+
+        metrics = {f"{metric_prefix}/reward_score": val_reward_score}
+        metrics.update({f"{metric_prefix}/{key}_reward": value for key, value in reward_metrics.items()})
+        metrics.update({f"{metric_prefix}/{key}": value for key, value in length_metrics.items()})
+        return metrics, val_reward_score
+
+    def _validate(self) -> dict[str, Any]:
+        has_extra_validations = len(self.extra_val_dataloaders) > 0
+        all_metrics = {}
+
+        if has_extra_validations:
+            primary_prefix = f"val/{self.primary_val_name}"
+            primary_metrics, primary_reward_score = self._validate_single(
+                self.primary_val_name,
+                self.val_dataloader,
+                self.val_reward_fn,
+                metric_prefix=primary_prefix,
+                log_generations=True,
+                legacy_format=False,
+            )
+            all_metrics.update(primary_metrics)
+            for key, value in primary_metrics.items():
+                if key.startswith(f"{primary_prefix}/"):
+                    suffix = key[len(primary_prefix) + 1 :]
+                    if suffix == "reward_score":
+                        all_metrics["val/reward_score"] = value
+                    elif suffix.endswith("_reward"):
+                        all_metrics[f"val/{suffix}"] = value
+                    else:
+                        all_metrics[f"val_{suffix}"] = value
+            self.val_reward_score = primary_reward_score
+        else:
+            primary_metrics, primary_reward_score = self._validate_single(
+                self.primary_val_name,
+                self.val_dataloader,
+                self.val_reward_fn,
+                metric_prefix="val",
+                log_generations=True,
+                legacy_format=True,
+            )
+            all_metrics.update(primary_metrics)
+            self.val_reward_score = primary_reward_score
+
+        for val_name, val_dataloader in self.extra_val_dataloaders.items():
+            reward_fn = self.extra_val_reward_fns[val_name]
+            metrics, _ = self._validate_single(
+                val_name,
+                val_dataloader,
+                reward_fn,
+                metric_prefix=f"val/{val_name}",
+                log_generations=False,
+                legacy_format=False,
+            )
+            all_metrics.update(metrics)
+
+        return all_metrics
 
     def _balance_batch(self, batch: DataProto, metrics: dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""

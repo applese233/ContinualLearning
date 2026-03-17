@@ -94,6 +94,7 @@ class RLHFDataset(Dataset):
         data_path: str,
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin],
+        max_samples: Optional[int] = None,
         prompt_key: str = "prompt",
         answer_key: str = "answer",
         image_key: str = "images",
@@ -148,6 +149,10 @@ class RLHFDataset(Dataset):
                 desc="Filtering overlong prompts",
                 num_proc=filter_overlong_prompts_workers,
             )
+
+        if max_samples is not None:
+            max_samples = min(max_samples, len(self.dataset))
+            self.dataset = self.dataset.select(range(max_samples))
 
     def _build_messages(self, example: dict[str, Any]) -> list[dict[str, Any]]:
         prompt_str: str = example[self.prompt_key]

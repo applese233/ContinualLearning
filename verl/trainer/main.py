@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+from copy import deepcopy
 
 import ray
 from omegaconf import OmegaConf
@@ -22,7 +23,7 @@ from ..utils.tokenizer import get_processor, get_tokenizer
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import AutoRewardManager
 from .config import PPOConfig
-from .data_loader import create_dataloader
+from .data_loader import create_dataloader, create_val_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
 
 
@@ -68,8 +69,26 @@ class Runner:
         RemoteRewardManager = ray.remote(AutoRewardManager).options(num_cpus=config.worker.reward.num_cpus)
         reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
         val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
+        extra_val_dataloaders = {}
+        extra_val_reward_fns = {}
 
         train_dataloader, val_dataloader = create_dataloader(config.data, tokenizer, processor)
+        for evaluation in config.evaluations:
+            reward_config = deepcopy(config.worker.reward)
+            if evaluation.reward_function is not None:
+                reward_config.reward_function = evaluation.reward_function
+            if evaluation.reward_function_kwargs:
+                reward_config.reward_function_kwargs = evaluation.reward_function_kwargs
+            reward_config.post_init()
+
+            extra_val_dataloaders[evaluation.name] = create_val_dataloader(
+                config.data, tokenizer, processor, validation_config=evaluation
+            )
+            extra_val_reward_fns[evaluation.name] = RemoteRewardManager.remote(reward_config, tokenizer)
+            print(
+                f"Size of validation dataloader ({evaluation.name}): "
+                f"{len(extra_val_dataloaders[evaluation.name])}"
+            )
 
         trainer = RayPPOTrainer(
             config=config,
@@ -82,6 +101,8 @@ class Runner:
             ray_worker_group_cls=ray_worker_group_cls,
             reward_fn=reward_fn,
             val_reward_fn=val_reward_fn,
+            extra_val_dataloaders=extra_val_dataloaders,
+            extra_val_reward_fns=extra_val_reward_fns,
         )
         trainer.init_workers()
         trainer.fit()
