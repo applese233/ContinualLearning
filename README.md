@@ -96,8 +96,8 @@ You do not need `sudo` to run EasyR1. A user-local Conda environment is enough i
 1. Create and activate a clean Conda environment.
 
 ```bash
-conda create -n easyr1 python=3.10 -y
-conda activate easyr1
+conda create -n ConLearn python=3.10 -y
+conda activate ConLearn
 python -m pip install --upgrade pip setuptools wheel
 ```
 
@@ -119,8 +119,23 @@ python -c "import flash_attn; print('flash-attn ok')"
 4. Prepare your datasets and launch training.
 
 ```bash
-python scripts/prepare_two_stage_datasets.py --output_dir data/two_stage_grpo
-bash examples/qwen2_5_7b_two_stage_grpo.sh
+python scripts/prepare_two_stage_datasets.py --output_dir data/multi_stage_grpo
+bash examples/qwen2_5_7b_multi_stage_grpo.sh
+```
+
+The default data prep now builds:
+
+- `deepscaler_train.parquet` and `deepscaler_val.parquet` from `agentica-org/DeepScaleR-Preview-Dataset` for the math stage.
+- `deepcoder_train.parquet` and `deepcoder_val.parquet` from `agentica-org/DeepCoder-Preview-Dataset` for the coding stage.
+- Legacy evaluation sets such as AIME25, MBPP, APPS, HumanEval, and LiveCodeBench.
+
+If you want to cap the new primary train/validation sets during preparation, you can pass limits explicitly:
+
+```bash
+python scripts/prepare_two_stage_datasets.py \
+  --output_dir data/multi_stage_grpo \
+  --deepscaler_val_limit 500 \
+  --deepcoder_val_limit 500
 ```
 
 Alternative stage schedules use the same training configs and only change stage orchestration:
@@ -130,9 +145,12 @@ STAGE_SEQUENCE=code,math bash examples/qwen2_5_7b_multi_stage_grpo.sh
 STAGE_SEQUENCE=math,code,math bash examples/qwen2_5_7b_multi_stage_grpo.sh
 BASE_MODEL_PATH=/path/to/hf_model bash examples/qwen2_5_7b_code_grpo.sh
 STAGE1_TOTAL_EPOCHS=1 STAGE2_TOTAL_EPOCHS=3 STAGE2_ACTOR_LR=3.0e-7 bash examples/qwen2_5_7b_multi_stage_grpo.sh
+STAGE3_TOTAL_EPOCHS=1 STAGE3_SAVE_FREQ=5 STAGE3_PRIMARY_VAL_LIMIT=64 bash examples/qwen2_5_7b_multi_stage_grpo.sh
 ```
 
 For multi-stage runs, the launcher also accepts stage-specific overrides using the `STAGE{n}_...` pattern. For example, `STAGE2_MAX_RESPONSE_LENGTH=1024` only affects the second stage, while `TOTAL_EPOCHS=2` still acts as a global fallback for stages that do not define a stage-specific override.
+
+When `PREPARE_DATA=1` is set on the launcher, it will prepare DeepScaleR and DeepCoder automatically before training.
 
 Notes:
 

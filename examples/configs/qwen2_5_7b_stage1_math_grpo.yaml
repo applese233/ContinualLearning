@@ -1,6 +1,7 @@
 data:
-  train_files: ${oc.env:DATA_DIR,./data/two_stage_grpo}/gsm8k_train.parquet
-  val_files: ${oc.env:DATA_DIR,./data/two_stage_grpo}/gsm8k_test.parquet
+  train_files: ${oc.env:DATA_DIR,./data/multi_stage_grpo}/deepscaler_train.parquet
+  val_files: ${oc.env:DATA_DIR,./data/multi_stage_grpo}/deepscaler_val.parquet
+  val_limit: ${oc.env:PRIMARY_VAL_LIMIT,256}
   prompt_key: prompt
   answer_key: answer
   image_key: images
@@ -103,7 +104,7 @@ trainer:
   val_freq: 20
   val_before_train: true
   val_only: false
-  primary_val_name: gsm8k
+  primary_val_name: deepscaler
   val_generations_to_log: 2
   save_freq: 20
   save_limit: 3
@@ -114,17 +115,20 @@ trainer:
 
 evaluations:
   - name: aime25
-    val_files: ${oc.env:DATA_DIR,./data/two_stage_grpo}/aime25_val.parquet
+    val_files: ${oc.env:DATA_DIR,./data/multi_stage_grpo}/aime25_val.parquet
+    val_limit: ${oc.env:AIME25_VAL_LIMIT,30}
     format_prompt: ./examples/format_prompt/math.jinja
     reward_function: ./examples/reward_function/math.py:compute_score
     val_batch_size: 64
   - name: mbpp
-    val_files: ${oc.env:DATA_DIR,./data/two_stage_grpo}/mbpp_test.parquet
+    val_files: ${oc.env:DATA_DIR,./data/multi_stage_grpo}/mbpp_test.parquet
+    val_limit: ${oc.env:MBPP_VAL_LIMIT,32}
     format_prompt: ./examples/format_prompt/code.jinja
     reward_function: ./examples/reward_function/code.py:compute_score
     val_batch_size: 16
   - name: livecodebench
-    val_files: ${oc.env:DATA_DIR,./data/two_stage_grpo}/livecodebench_val.parquet
+    val_files: ${oc.env:DATA_DIR,./data/multi_stage_grpo}/livecodebench_val.parquet
+    val_limit: ${oc.env:LIVECODEBENCH_VAL_LIMIT,32}
     format_prompt: ./examples/format_prompt/code.jinja
     reward_function: ./examples/reward_function/code.py:compute_score
     val_batch_size: 8

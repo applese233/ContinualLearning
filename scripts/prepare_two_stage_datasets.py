@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import pickle
+import random
 import re
 import zlib
 from datetime import datetime
@@ -31,9 +32,44 @@ from huggingface_hub import hf_hub_download, snapshot_download
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare math and coding datasets for two-stage EasyR1 training.")
-    parser.add_argument("--output_dir", default="data/two_stage_grpo", help="Directory to save parquet files.")
+    parser.add_argument("--output_dir", default="data/multi_stage_grpo", help="Directory to save parquet files.")
+    parser.add_argument(
+        "--deepscaler_train_limit",
+        type=int,
+        default=None,
+        help="Maximum DeepScaleR training samples to keep after validation split.",
+    )
+    parser.add_argument(
+        "--deepscaler_val_limit",
+        type=int,
+        default=500,
+        help="Maximum DeepScaleR validation samples to keep.",
+    )
+    parser.add_argument(
+        "--deepcoder_train_limit",
+        type=int,
+        default=None,
+        help="Maximum DeepCoder training samples to keep.",
+    )
+    parser.add_argument(
+        "--deepcoder_val_limit",
+        type=int,
+        default=500,
+        help="Maximum DeepCoder validation samples to keep.",
+    )
+    parser.add_argument(
+        "--deepcoder_train_configs",
+        nargs="*",
+        default=["primeintellect", "taco", "lcbv5"],
+        help="DeepCoder subsets to use for training.",
+    )
+    parser.add_argument(
+        "--deepcoder_val_configs",
+        nargs="*",
+        default=["codeforces", "lcbv5"],
+        help="DeepCoder subsets to use for validation.",
+    )
     parser.add_argument("--apps_train_limit", type=int, default=5000, help="Maximum APPS training samples to keep.")
-    parser.add_argument("--gsm8k_test_limit", type=int, default=None, help="Maximum GSM8K test samples to keep.")
     parser.add_argument("--aime25_val_limit", type=int, default=None, help="Maximum AIME 2025 validation samples to keep.")
     parser.add_argument("--mbpp_test_limit", type=int, default=None, help="Maximum MBPP test samples to keep.")
     parser.add_argument("--apps_test_limit", type=int, default=None, help="Maximum APPS test samples to keep.")
@@ -64,13 +100,6 @@ def find_first(record: dict, keys: list[str]):
         if key in record and record[key] is not None:
             return record[key]
     raise KeyError(f"None of the candidate keys exist: {keys}")
-
-
-def extract_gsm8k_answer(answer: str) -> str:
-    match = re.search(r"####\s*(.+)", answer)
-    if match:
-        return match.group(1).strip()
-    return answer.strip()
 
 
 def save_parquet(rows: list[dict], path: Path) -> None:
@@ -115,29 +144,176 @@ def build_code_prompt(question: str, starter_code: str | None = None) -> str:
     return "\n\n".join(parts)
 
 
-def prepare_gsm8k(output_dir: Path, test_limit: int | None = None) -> None:
-    log_step("Preparing GSM8K...")
-    snapshot_dir = download_hf_dataset_snapshot("openai/gsm8k", ["main/*.parquet", "README.md"])
-    dataset = load_dataset(
-        "parquet",
-        data_files={
-            "train": find_local_files(snapshot_dir / "main", "train-*.parquet"),
-            "test": find_local_files(snapshot_dir / "main", "test-*.parquet"),
-        },
-    )
+def prepare_deepscaler(
+    output_dir: Path,
+    train_limit: int | None = None,
+    val_limit: int | None = 500,
+) -> tuple[list[dict], list[dict]]:
+    log_step("Preparing DeepScaleR preview dataset...")
+    dataset = load_dataset("agentica-org/DeepScaleR-Preview-Dataset", split="train")
 
-    for split_name, output_name in (("train", "gsm8k_train.parquet"), ("test", "gsm8k_test.parquet")):
-        rows = []
-        for sample in dataset[split_name]:
+    rows = []
+    for sample in dataset:
+        problem = str(sample.get("problem", "")).strip()
+        answer = str(sample.get("answer", "")).strip()
+        if not problem or not answer:
+            continue
+        rows.append({"prompt": problem, "answer": answer})
+
+    random.Random(42).shuffle(rows)
+    val_size = min(max(val_limit or 0, 0), max(len(rows) - 1, 0))
+    val_rows = rows[:val_size]
+    train_rows = rows[val_size:]
+    if train_limit is not None:
+        train_rows = train_rows[:train_limit]
+
+    save_parquet(train_rows, output_dir / "deepscaler_train.parquet")
+    save_parquet(val_rows, output_dir / "deepscaler_val.parquet")
+    return train_rows, val_rows
+
+
+def parse_json_field(value):
+    if not isinstance(value, str):
+        return value
+
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError:
+        return value
+
+
+def build_deepcoder_prompt(problem: str, starter_code: str | None = None) -> str:
+    normalized_problem = problem.strip()
+    if normalized_problem.lower().startswith("solve the following coding problem using the programming language python"):
+        parts = [normalized_problem]
+        if starter_code:
+            parts.extend(["Starter code:", "```python", starter_code.rstrip(), "```"])
+        parts.append("Return only executable Python code inside a single ```python``` block.")
+        return "\n\n".join(parts)
+
+    return build_code_prompt(normalized_problem, starter_code)
+
+
+def build_deepcoder_answer(sample: dict) -> str | None:
+    parsed_tests = parse_json_field(sample.get("tests"))
+    metadata = parse_json_field(sample.get("metadata"))
+    fn_name = None
+    if isinstance(metadata, dict):
+        fn_name = metadata.get("func_name")
+
+    if isinstance(parsed_tests, list):
+        inputs = []
+        outputs = []
+        for case in parsed_tests:
+            if not isinstance(case, dict):
+                continue
+            case_type = str(case.get("testtype") or case.get("type") or "").lower()
+            if case_type not in ("", "stdin", "stdin_stdout"):
+                continue
+            if "input" not in case or "output" not in case:
+                continue
+            inputs.append(case["input"])
+            outputs.append(case["output"])
+
+        if not inputs or len(inputs) != len(outputs):
+            return None
+
+        return json.dumps(
+            {
+                "test_type": "input_output",
+                "inputs": inputs,
+                "outputs": outputs,
+                "fn_name": fn_name,
+            },
+            ensure_ascii=False,
+        )
+
+    if isinstance(parsed_tests, dict):
+        inputs = parsed_tests.get("inputs")
+        outputs = parsed_tests.get("outputs")
+        if isinstance(inputs, list) and isinstance(outputs, list) and inputs and len(inputs) == len(outputs):
+            return json.dumps(
+                {
+                    "test_type": "input_output",
+                    "inputs": inputs,
+                    "outputs": outputs,
+                    "fn_name": parsed_tests.get("fn_name") or fn_name,
+                },
+                ensure_ascii=False,
+            )
+
+        if "input" in parsed_tests and "output" in parsed_tests:
+            return json.dumps(
+                {
+                    "test_type": "input_output",
+                    "inputs": [parsed_tests["input"]],
+                    "outputs": [parsed_tests["output"]],
+                    "fn_name": parsed_tests.get("fn_name") or fn_name,
+                },
+                ensure_ascii=False,
+            )
+
+    return None
+
+
+def prepare_deepcoder_split(
+    configs: list[str],
+    split_name: str,
+    limit: int | None = None,
+) -> list[dict]:
+    rows = []
+    for config_name in configs:
+        log_step(f"Preparing DeepCoder subset {config_name}/{split_name}...")
+        dataset = load_dataset(
+            "agentica-org/DeepCoder-Preview-Dataset",
+            config_name,
+            split=split_name,
+            streaming=True,
+        )
+
+        scanned = 0
+        for sample in dataset:
+            scanned += 1
+            problem = str(sample.get("problem", "")).strip()
+            if not problem:
+                continue
+
+            answer = build_deepcoder_answer(sample)
+            if answer is None:
+                continue
+
+            starter_code = sample.get("starter_code") or None
             rows.append(
                 {
-                    "prompt": sample["question"].strip(),
-                    "answer": extract_gsm8k_answer(sample["answer"]),
+                    "prompt": build_deepcoder_prompt(problem, starter_code=starter_code),
+                    "answer": answer,
                 }
             )
-            if split_name == "test" and test_limit is not None and len(rows) >= test_limit:
-                break
-        save_parquet(rows, output_dir / output_name)
+
+            if len(rows) == 1 or len(rows) % 250 == 0:
+                log_step(f"DeepCoder {split_name}: kept {len(rows)} samples after scanning {scanned} rows from {config_name}")
+
+            if limit is not None and len(rows) >= limit:
+                return rows
+
+    return rows
+
+
+def prepare_deepcoder(
+    output_dir: Path,
+    train_limit: int | None = None,
+    val_limit: int | None = 500,
+    train_configs: list[str] | None = None,
+    val_configs: list[str] | None = None,
+) -> tuple[list[dict], list[dict]]:
+    train_configs = train_configs or ["primeintellect", "taco", "lcbv5"]
+    val_configs = val_configs or ["codeforces", "lcbv5"]
+
+    train_rows = prepare_deepcoder_split(train_configs, split_name="train", limit=train_limit)
+    val_rows = prepare_deepcoder_split(val_configs, split_name="test", limit=val_limit)
+    save_parquet(train_rows, output_dir / "deepcoder_train.parquet")
+    save_parquet(val_rows, output_dir / "deepcoder_val.parquet")
+    return train_rows, val_rows
 
 
 def prepare_aime25(output_dir: Path, val_limit: int | None = None) -> None:
@@ -390,7 +566,18 @@ def prepare_coding_mix(output_dir: Path, mbpp_train: list[dict], apps_train: lis
 def main() -> None:
     args = parse_args()
     output_dir = ensure_output_dir(args.output_dir)
-    prepare_gsm8k(output_dir, test_limit=args.gsm8k_test_limit)
+    prepare_deepscaler(
+        output_dir,
+        train_limit=args.deepscaler_train_limit,
+        val_limit=args.deepscaler_val_limit,
+    )
+    prepare_deepcoder(
+        output_dir,
+        train_limit=args.deepcoder_train_limit,
+        val_limit=args.deepcoder_val_limit,
+        train_configs=args.deepcoder_train_configs,
+        val_configs=args.deepcoder_val_configs,
+    )
     prepare_aime25(output_dir, val_limit=args.aime25_val_limit)
     mbpp_train, _ = prepare_mbpp(output_dir, test_limit=args.mbpp_test_limit)
     apps_train, _ = prepare_apps(
