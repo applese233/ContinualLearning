@@ -1,9 +1,32 @@
 #!/bin/bash
 
-set -euo pipefail
+set -Eeuo pipefail
 set -x
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+log_info() {
+    echo "[$(timestamp)] [multi-stage] $*"
+}
+
+log_error() {
+    echo "[$(timestamp)] [multi-stage][error] $*" >&2
+}
+
+CURRENT_STAGE_LABEL="init"
+
+on_error() {
+    local exit_code=$?
+    local line_no="${1:-unknown}"
+    log_error "exit_code=${exit_code} stage=${CURRENT_STAGE_LABEL} line=${line_no} command=${BASH_COMMAND}"
+    exit "${exit_code}"
+}
+
+trap 'on_error ${LINENO}' ERR
 
 # Default sequence keeps the existing math -> code workflow.
 # Alternative examples:
@@ -23,7 +46,7 @@ DATA_DIR="${DATA_DIR:-${ROOT_DIR}/data/multi_stage_grpo}"
 PREPARE_DATA="${PREPARE_DATA:-0}"
 PREPARE_ONLY="${PREPARE_ONLY:-0}"
 STAGE_SEQUENCE="${STAGE_SEQUENCE:-math,code}"
-PROJECT_NAME="${PROJECT_NAME:-ContinueLearning}"
+PROJECT_NAME="${PROJECT_NAME:-ContinualLearning}"
 NNODES="${NNODES:-1}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-4}"
 CHECKPOINT_SELECTION="${CHECKPOINT_SELECTION:-best}"
@@ -45,7 +68,7 @@ STAGE1_MAX_STEPS="${STAGE1_MAX_STEPS:-400}"
 STAGE1_VAL_FREQ="${STAGE1_VAL_FREQ:-50}"
 STAGE1_SAVE_FREQ="${STAGE1_SAVE_FREQ:-50}"
 STAGE1_SAVE_LIMIT="${STAGE1_SAVE_LIMIT:-2}"
-STAGE1_FIND_LAST_CHECKPOINT="${STAGE1_FIND_LAST_CHECKPOINT:-true}"
+STAGE1_FIND_LAST_CHECKPOINT="${STAGE1_FIND_LAST_CHECKPOINT:-false}"
 STAGE1_ACTOR_GLOBAL_BATCH_SIZE="${STAGE1_ACTOR_GLOBAL_BATCH_SIZE:-32}"
 STAGE1_ROLLOUT_BATCH_SIZE="${STAGE1_ROLLOUT_BATCH_SIZE:-32}"
 STAGE1_VAL_BATCH_SIZE="${STAGE1_VAL_BATCH_SIZE:-32}"
@@ -53,12 +76,12 @@ STAGE1_MICRO_BATCH_SIZE_UPDATE="${STAGE1_MICRO_BATCH_SIZE_UPDATE:-4}"
 STAGE1_MICRO_BATCH_SIZE_EXPERIENCE="${STAGE1_MICRO_BATCH_SIZE_EXPERIENCE:-4}"
 STAGE1_GPU_MEMORY_UTILIZATION="${STAGE1_GPU_MEMORY_UTILIZATION:-0.8}"
 STAGE1_MAX_PROMPT_LENGTH="${STAGE1_MAX_PROMPT_LENGTH:-1536}"
-STAGE1_MAX_RESPONSE_LENGTH="${STAGE1_MAX_RESPONSE_LENGTH:-1024}"
+STAGE1_MAX_RESPONSE_LENGTH="${STAGE1_MAX_RESPONSE_LENGTH:-4096}"
 STAGE1_ACTOR_LR="${STAGE1_ACTOR_LR:-1.0e-6}"
 STAGE1_PRIMARY_VAL_LIMIT="${STAGE1_PRIMARY_VAL_LIMIT:-256}"
 STAGE1_AIME25_VAL_LIMIT="${STAGE1_AIME25_VAL_LIMIT:-30}"
-STAGE1_MBPP_VAL_LIMIT="${STAGE1_MBPP_VAL_LIMIT:-16}"
-STAGE1_LIVECODEBENCH_VAL_LIMIT="${STAGE1_LIVECODEBENCH_VAL_LIMIT:-16}"
+STAGE1_MBPP_VAL_LIMIT="${STAGE1_MBPP_VAL_LIMIT:-32}"
+STAGE1_LIVECODEBENCH_VAL_LIMIT="${STAGE1_LIVECODEBENCH_VAL_LIMIT:-32}"
 
 STAGE2_TOTAL_EPOCHS="${STAGE2_TOTAL_EPOCHS:-2}"
 STAGE2_MAX_STEPS="${STAGE2_MAX_STEPS:-400}"
@@ -73,12 +96,12 @@ STAGE2_MICRO_BATCH_SIZE_UPDATE="${STAGE2_MICRO_BATCH_SIZE_UPDATE:-4}"
 STAGE2_MICRO_BATCH_SIZE_EXPERIENCE="${STAGE2_MICRO_BATCH_SIZE_EXPERIENCE:-4}"
 STAGE2_GPU_MEMORY_UTILIZATION="${STAGE2_GPU_MEMORY_UTILIZATION:-0.8}"
 STAGE2_MAX_PROMPT_LENGTH="${STAGE2_MAX_PROMPT_LENGTH:-1536}"
-STAGE2_MAX_RESPONSE_LENGTH="${STAGE2_MAX_RESPONSE_LENGTH:-1024}"
+STAGE2_MAX_RESPONSE_LENGTH="${STAGE2_MAX_RESPONSE_LENGTH:-4096}"
 STAGE2_ACTOR_LR="${STAGE2_ACTOR_LR:-5.0e-7}"
 STAGE2_PRIMARY_VAL_LIMIT="${STAGE2_PRIMARY_VAL_LIMIT:-128}"
-STAGE2_APPS_VAL_LIMIT="${STAGE2_APPS_VAL_LIMIT:-16}"
-STAGE2_HUMANEVAL_VAL_LIMIT="${STAGE2_HUMANEVAL_VAL_LIMIT:-16}"
-STAGE2_LIVECODEBENCH_VAL_LIMIT="${STAGE2_LIVECODEBENCH_VAL_LIMIT:-16}"
+STAGE2_APPS_VAL_LIMIT="${STAGE2_APPS_VAL_LIMIT:-32}"
+STAGE2_HUMANEVAL_VAL_LIMIT="${STAGE2_HUMANEVAL_VAL_LIMIT:-32}"
+STAGE2_LIVECODEBENCH_VAL_LIMIT="${STAGE2_LIVECODEBENCH_VAL_LIMIT:-32}"
 STAGE2_AIME25_VAL_LIMIT="${STAGE2_AIME25_VAL_LIMIT:-30}"
 
 STAGE3_TOTAL_EPOCHS="${STAGE3_TOTAL_EPOCHS:-2}"
@@ -177,6 +200,7 @@ get_stage_experiment_name() {
 }
 
 if [[ "${PREPARE_DATA}" == "1" ]]; then
+    log_info "Preparing datasets into ${DATA_DIR}"
     PREPARE_ARGS=(
         "--output_dir" "${DATA_DIR}"
         "--deepscaler_val_limit" "${DEEPSCALER_VAL_LIMIT}"
@@ -192,13 +216,17 @@ if [[ "${PREPARE_DATA}" == "1" ]]; then
     [[ -n "${LIVECODEBENCH_VAL_LIMIT}" ]] && PREPARE_ARGS+=("--livecodebench_val_limit" "${LIVECODEBENCH_VAL_LIMIT}")
 
     python3 "${ROOT_DIR}/scripts/prepare_two_stage_datasets.py" "${PREPARE_ARGS[@]}"
+    log_info "Dataset preparation finished"
 fi
 
 if [[ "${PREPARE_ONLY}" == "1" ]]; then
+    log_info "PREPARE_ONLY=1, exiting after dataset preparation"
     exit 0
 fi
 
 IFS=',' read -r -a STAGES <<< "${STAGE_SEQUENCE}"
+
+log_info "Starting multi-stage run: project=${PROJECT_NAME} stages=${STAGE_SEQUENCE} checkpoint_root=${CHECKPOINT_DIR_ROOT} model=${MODEL_PATH}"
 
 LAST_EXPERIMENT_NAME=""
 for stage_idx in "${!STAGES[@]}"; do
@@ -222,6 +250,7 @@ for stage_idx in "${!STAGES[@]}"; do
         [[ -z "${base_model_path}" ]] && base_model_path="${MODEL_PATH}"
     else
         [[ -z "${previous_experiment_name}" ]] && previous_experiment_name="${LAST_EXPERIMENT_NAME}"
+        [[ -z "${previous_checkpoint_root}" && -n "${previous_experiment_name}" ]] && previous_checkpoint_root="${CHECKPOINT_DIR_ROOT}/${previous_experiment_name}"
     fi
 
     [[ -n "${base_model_path}" ]] && stage_env+=("BASE_MODEL_PATH=${base_model_path}")
@@ -229,12 +258,28 @@ for stage_idx in "${!STAGES[@]}"; do
     [[ -n "${previous_checkpoint_root}" ]] && stage_env+=("PREV_STAGE_CHECKPOINT_ROOT=${previous_checkpoint_root}")
     append_stage_override_envs "${stage_number}" stage_env
 
+    CURRENT_STAGE_LABEL="stage${stage_number}:${stage_type}:${experiment_name}"
+    log_info "Entering ${CURRENT_STAGE_LABEL}"
+    log_info "Resolved stage config: base_model_path=${base_model_path:-<empty>} previous_experiment_name=${previous_experiment_name:-<empty>} previous_checkpoint_root=${previous_checkpoint_root:-<empty>}"
+
     case "${stage_type}" in
         math)
-            env "${stage_env[@]}" bash "${MATH_STAGE_BASH}"
+            if env "${stage_env[@]}" bash "${MATH_STAGE_BASH}"; then
+                log_info "Completed ${CURRENT_STAGE_LABEL}"
+            else
+                stage_status=$?
+                log_error "Stage command failed for ${CURRENT_STAGE_LABEL} with exit_code=${stage_status}"
+                exit "${stage_status}"
+            fi
             ;;
         code)
-            env "${stage_env[@]}" bash "${CODE_STAGE_BASH}"
+            if env "${stage_env[@]}" bash "${CODE_STAGE_BASH}"; then
+                log_info "Completed ${CURRENT_STAGE_LABEL}"
+            else
+                stage_status=$?
+                log_error "Stage command failed for ${CURRENT_STAGE_LABEL} with exit_code=${stage_status}"
+                exit "${stage_status}"
+            fi
             ;;
         *)
             echo "Unsupported stage type: ${stage_type}. Expected one of: math, code." >&2
@@ -244,3 +289,6 @@ for stage_idx in "${!STAGES[@]}"; do
 
     LAST_EXPERIMENT_NAME="${experiment_name}"
 done
+
+CURRENT_STAGE_LABEL="done"
+log_info "All stages completed successfully"
