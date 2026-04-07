@@ -1,9 +1,11 @@
 import ast
+import os
 import json
 import re
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -174,12 +176,34 @@ def _run_stdio_case(program: str, test_input: Any, expected_output: Any, timeout
     return _normalize_text_output(stdout) == _normalize_text_output(expected_output)
 
 
-def _input_output_pass_ratio(spec: dict[str, Any], program: str, timeout: float) -> float:
+def _normalize_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+
+    normalized = int(value)
+    return normalized if normalized > 0 else None
+
+
+def _input_output_pass_ratio(
+    spec: dict[str, Any],
+    program: str,
+    timeout: float,
+    max_tests_per_sample: int | None = None,
+) -> float:
     inputs = spec.get("inputs", [])
     outputs = spec.get("outputs", [])
     fn_name = spec.get("fn_name")
     if not inputs or not outputs or len(inputs) != len(outputs):
         return 0.0
+
+    if max_tests_per_sample is not None:
+        inputs = inputs[:max_tests_per_sample]
+        outputs = outputs[:max_tests_per_sample]
 
     passed = 0
     for test_input, expected_output in zip(inputs, outputs):
@@ -191,7 +215,12 @@ def _input_output_pass_ratio(spec: dict[str, Any], program: str, timeout: float)
     return passed / len(inputs)
 
 
-def _pass_ratio(program: str, spec: dict[str, Any], timeout: float) -> float:
+def _pass_ratio(
+    program: str,
+    spec: dict[str, Any],
+    timeout: float,
+    max_tests_per_sample: int | None = None,
+) -> float:
     setup_code = spec.get("setup_code", "")
     test_type = spec.get("test_type", "assert_list")
 
@@ -212,11 +241,19 @@ def _pass_ratio(program: str, spec: dict[str, Any], timeout: float) -> float:
 
     if test_type == "input_output":
         runner = "\n\n".join(part for part in (program, setup_code) if part)
-        return _input_output_pass_ratio(spec, runner, timeout=timeout)
+        return _input_output_pass_ratio(
+            spec,
+            runner,
+            timeout=timeout,
+            max_tests_per_sample=max_tests_per_sample,
+        )
 
     tests = spec.get("tests", [])
     if isinstance(tests, str):
         tests = [tests]
+
+    if max_tests_per_sample is not None:
+        tests = tests[:max_tests_per_sample]
 
     if not tests:
         return 0.0
@@ -229,28 +266,70 @@ def _pass_ratio(program: str, spec: dict[str, Any], timeout: float) -> float:
     return passed / len(tests)
 
 
+def _score_single(
+    reward_input: dict[str, Any],
+    format_weight: float,
+    syntax_weight: float,
+    timeout: float,
+    max_tests_per_sample: int | None,
+) -> dict[str, float]:
+    spec = _normalize_ground_truth(reward_input["ground_truth"])
+    code, format_score = _extract_code(reward_input["response"])
+    program = _build_candidate_program(code, spec)
+    syntax_score = _syntax_reward(program)
+    accuracy_score = (
+        _pass_ratio(program, spec, timeout=timeout, max_tests_per_sample=max_tests_per_sample) if syntax_score else 0.0
+    )
+    overall = max(0.0, 1.0 - format_weight - syntax_weight) * accuracy_score
+    overall += format_weight * format_score + syntax_weight * syntax_score
+    return {
+        "overall": overall,
+        "format": format_score,
+        "syntax": syntax_score,
+        "accuracy": accuracy_score,
+    }
+
+
 def compute_score(
     reward_inputs: list[dict[str, Any]],
     format_weight: float = 0.05,
     syntax_weight: float = 0.05,
     timeout: float = 5.0,
+    parallel_workers: int | None = None,
+    max_tests_per_sample: int | None = None,
 ) -> list[dict[str, float]]:
-    scores = []
-    for reward_input in reward_inputs:
-        spec = _normalize_ground_truth(reward_input["ground_truth"])
-        code, format_score = _extract_code(reward_input["response"])
-        program = _build_candidate_program(code, spec)
-        syntax_score = _syntax_reward(program)
-        accuracy_score = _pass_ratio(program, spec, timeout=timeout) if syntax_score else 0.0
-        overall = max(0.0, 1.0 - format_weight - syntax_weight) * accuracy_score
-        overall += format_weight * format_score + syntax_weight * syntax_score
-        scores.append(
-            {
-                "overall": overall,
-                "format": format_score,
-                "syntax": syntax_score,
-                "accuracy": accuracy_score,
-            }
-        )
+    env_parallel_workers = os.getenv("EASYR1_CODE_REWARD_WORKERS")
+    env_max_tests = os.getenv("EASYR1_CODE_REWARD_MAX_TESTS")
 
-    return scores
+    parallel_workers = _normalize_optional_int(
+        parallel_workers if parallel_workers is not None else env_parallel_workers
+    )
+    max_tests_per_sample = _normalize_optional_int(
+        max_tests_per_sample if max_tests_per_sample is not None else env_max_tests
+    )
+
+    if parallel_workers is None or parallel_workers == 1 or len(reward_inputs) <= 1:
+        return [
+            _score_single(
+                reward_input,
+                format_weight=format_weight,
+                syntax_weight=syntax_weight,
+                timeout=timeout,
+                max_tests_per_sample=max_tests_per_sample,
+            )
+            for reward_input in reward_inputs
+        ]
+
+    with ThreadPoolExecutor(max_workers=min(parallel_workers, len(reward_inputs))) as executor:
+        return list(
+            executor.map(
+                lambda reward_input: _score_single(
+                    reward_input,
+                    format_weight=format_weight,
+                    syntax_weight=syntax_weight,
+                    timeout=timeout,
+                    max_tests_per_sample=max_tests_per_sample,
+                ),
+                reward_inputs,
+            )
+        )

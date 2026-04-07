@@ -125,10 +125,18 @@ evaluations:
     val_limit: ${oc.env:MBPP_VAL_LIMIT,32}
     format_prompt: ./examples/format_prompt/code.jinja
     reward_function: ./examples/reward_function/code.py:compute_score
+    reward_function_kwargs:
+      timeout: 5.0
+      parallel_workers: ${oc.env:CODE_REWARD_WORKERS,8}
+      max_tests_per_sample: ${oc.env:CODE_REWARD_MAX_TESTS,8}
     val_batch_size: 16
   - name: livecodebench
     val_files: ${oc.env:DATA_DIR,./data/multi_stage_grpo}/livecodebench_val.parquet
     val_limit: ${oc.env:LIVECODEBENCH_VAL_LIMIT,32}
     format_prompt: ./examples/format_prompt/code.jinja
     reward_function: ./examples/reward_function/code.py:compute_score
+    reward_function_kwargs:
+      timeout: 5.0
+      parallel_workers: ${oc.env:CODE_REWARD_WORKERS,8}
+      max_tests_per_sample: ${oc.env:CODE_REWARD_MAX_TESTS,8}
     val_batch_size: 8
