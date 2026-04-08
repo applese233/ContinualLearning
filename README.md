@@ -123,19 +123,52 @@ python scripts/prepare_two_stage_datasets.py --output_dir data/multi_stage_grpo
 bash examples/qwen2_5_7b_multi_stage_grpo.sh
 ```
 
+If you only want to prepare a subset, pass `--datasets` with comma- or space-separated names:
+
+```bash
+python scripts/prepare_two_stage_datasets.py \
+  --output_dir data/multi_stage_grpo \
+  --datasets "aime24 aime25 amc math500 minerva olympiadbench humanevalplus taco"
+```
+
 The default data prep now builds:
 
 - `deepscaler_train.parquet` and `deepscaler_val.parquet` from `agentica-org/DeepScaleR-Preview-Dataset` for the math stage.
 - `deepcoder_train.parquet` and `deepcoder_val.parquet` from `agentica-org/DeepCoder-Preview-Dataset` for the coding stage.
-- Legacy evaluation sets such as AIME25, MBPP, APPS, HumanEval, and LiveCodeBench.
+- Additional math evaluation sets such as AIME24, AIME25, AMC, MATH-500, Minerva Math, and OlympiadBench.
+- Additional coding evaluation sets such as HumanEval, HumanEval+, LiveCodeBench, MBPP, APPS, and TACO.
 
 If you want to cap the new primary train/validation sets during preparation, you can pass limits explicitly:
 
 ```bash
 python scripts/prepare_two_stage_datasets.py \
   --output_dir data/multi_stage_grpo \
+  --math500_val_limit 128 \
+  --minerva_val_limit 64 \
+  --olympiadbench_val_limit 64 \
+  --aime24_val_limit 30 \
   --deepscaler_val_limit 500 \
   --deepcoder_val_limit 500
+```
+
+To run the direct vLLM evaluator on the expanded suite, the wrapper now accepts these benchmark names directly through `DATASETS`, for example:
+
+```bash
+DATASETS="aime24 aime25 amc math500 minerva olympiadbench humaneval humanevalplus livecodebench taco" \
+CUDA_VISIBLE_DEVICES=4 \
+bash examples/qwen2_5_7b_direct_eval.sh
+```
+
+The direct evaluator now keeps per-sample detail files smaller by default:
+
+- `*_eval_results.json` keeps only a small sampled subset of detailed rows, controlled by `SAMPLE_DETAILS` (default `5`).
+- full `*_generations.jsonl` exports are no longer written unless you explicitly opt in.
+- for code benchmarks, the saved detail rows keep only a short ground-truth preview plus byte count instead of full hidden test payloads.
+
+If you need the raw model output for debugging, enable it explicitly:
+
+```bash
+SAVE_ALL_GENERATIONS=1 SAVE_FULL_RESPONSE=1 bash examples/qwen2_5_7b_direct_eval.sh
 ```
 
 Alternative stage schedules use the same training configs and only change stage orchestration:

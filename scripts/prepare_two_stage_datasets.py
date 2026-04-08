@@ -34,6 +34,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prepare math and coding datasets for two-stage EasyR1 training.")
     parser.add_argument("--output_dir", default="data/multi_stage_grpo", help="Directory to save parquet files.")
     parser.add_argument(
+        "--datasets",
+        default="all",
+        help=(
+            "Datasets to prepare, separated by commas or spaces. Supported: all, deepscaler, deepcoder, "
+            "aime24, aime25, amc, math500, minerva, olympiadbench, mbpp, apps, humaneval, "
+            "humanevalplus, livecodebench, taco, coding_train_mix."
+        ),
+    )
+    parser.add_argument(
         "--deepscaler_train_limit",
         type=int,
         default=None,
@@ -70,16 +79,33 @@ def parse_args() -> argparse.Namespace:
         help="DeepCoder subsets to use for validation.",
     )
     parser.add_argument("--apps_train_limit", type=int, default=5000, help="Maximum APPS training samples to keep.")
+    parser.add_argument("--aime24_val_limit", type=int, default=None, help="Maximum AIME 2024 validation samples to keep.")
     parser.add_argument("--aime25_val_limit", type=int, default=None, help="Maximum AIME 2025 validation samples to keep.")
+    parser.add_argument("--amc_val_limit", type=int, default=None, help="Maximum AMC validation samples to keep.")
+    parser.add_argument("--math500_val_limit", type=int, default=None, help="Maximum MATH-500 validation samples to keep.")
+    parser.add_argument("--minerva_val_limit", type=int, default=None, help="Maximum Minerva Math validation samples to keep.")
+    parser.add_argument(
+        "--olympiadbench_val_limit",
+        type=int,
+        default=None,
+        help="Maximum OlympiadBench validation samples to keep.",
+    )
     parser.add_argument("--mbpp_test_limit", type=int, default=None, help="Maximum MBPP test samples to keep.")
     parser.add_argument("--apps_test_limit", type=int, default=None, help="Maximum APPS test samples to keep.")
     parser.add_argument("--humaneval_val_limit", type=int, default=None, help="Maximum HumanEval validation samples to keep.")
+    parser.add_argument(
+        "--humanevalplus_val_limit",
+        type=int,
+        default=None,
+        help="Maximum HumanEval+ validation samples to keep.",
+    )
     parser.add_argument(
         "--livecodebench_val_limit",
         type=int,
         default=None,
         help="Maximum LiveCodeBench validation samples to keep.",
     )
+    parser.add_argument("--taco_test_limit", type=int, default=None, help="Maximum TACO test samples to keep.")
     parser.add_argument(
         "--apps_difficulties",
         nargs="*",
@@ -95,11 +121,71 @@ def ensure_output_dir(path: str) -> Path:
     return output_dir
 
 
+def parse_dataset_names(raw_value: str) -> set[str]:
+    dataset_names = {item.strip() for item in re.split(r"[\s,]+", raw_value) if item.strip()}
+    if not dataset_names or "all" in dataset_names:
+        return {
+            "deepscaler",
+            "deepcoder",
+            "aime24",
+            "aime25",
+            "amc",
+            "math500",
+            "minerva",
+            "olympiadbench",
+            "mbpp",
+            "apps",
+            "humaneval",
+            "humanevalplus",
+            "livecodebench",
+            "taco",
+            "coding_train_mix",
+        }
+
+    supported = {
+        "deepscaler",
+        "deepcoder",
+        "aime24",
+        "aime25",
+        "amc",
+        "math500",
+        "minerva",
+        "olympiadbench",
+        "mbpp",
+        "apps",
+        "humaneval",
+        "humanevalplus",
+        "livecodebench",
+        "taco",
+        "coding_train_mix",
+    }
+    unknown = sorted(dataset_names - supported)
+    if unknown:
+        raise ValueError(f"Unsupported dataset names: {unknown}")
+
+    return dataset_names
+
+
 def find_first(record: dict, keys: list[str]):
     for key in keys:
         if key in record and record[key] is not None:
             return record[key]
     raise KeyError(f"None of the candidate keys exist: {keys}")
+
+
+def format_scalar_answer(value) -> str:
+    if isinstance(value, bool):
+        return str(value)
+
+    if isinstance(value, int):
+        return str(value)
+
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    return str(value).strip()
 
 
 def save_parquet(rows: list[dict], path: Path) -> None:
@@ -142,6 +228,35 @@ def build_code_prompt(question: str, starter_code: str | None = None) -> str:
         parts.extend(["Starter code:", "```python", starter_code.rstrip(), "```"])
     parts.append("Return only executable Python code inside a single ```python``` block.")
     return "\n\n".join(parts)
+
+
+def extract_balanced_braced_content(text: str, start_index: int) -> str | None:
+    depth = 0
+    content: list[str] = []
+    for char in text[start_index:]:
+        if char == "{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return "".join(content)
+            if depth < 0:
+                return None
+
+        if depth >= 1:
+            content.append(char)
+
+    return None
+
+
+def extract_last_boxed_answer(text: str) -> str | None:
+    marker = "\\boxed{"
+    position = text.rfind(marker)
+    if position < 0:
+        return None
+    return extract_balanced_braced_content(text, position + len("\\boxed"))
 
 
 def prepare_deepscaler(
@@ -346,6 +461,124 @@ def prepare_aime25(output_dir: Path, val_limit: int | None = None) -> None:
     save_parquet(rows, output_dir / "aime25_val.parquet")
 
 
+def prepare_aime24(output_dir: Path, val_limit: int | None = None) -> None:
+    log_step("Preparing AIME 2024...")
+    dataset = load_dataset("Maxwell-Jia/AIME_2024", split="train")
+
+    rows = []
+    for sample in dataset:
+        prompt = str(find_first(sample, ["Problem", "problem", "question"]))
+        answer = str(find_first(sample, ["Answer", "answer", "final_answer", "solution"]))
+        rows.append(
+            {
+                "prompt": prompt.strip(),
+                "answer": answer.strip(),
+            }
+        )
+        if val_limit is not None and len(rows) >= val_limit:
+            break
+
+    save_parquet(rows, output_dir / "aime24_val.parquet")
+
+
+def prepare_amc(output_dir: Path, val_limit: int | None = None) -> None:
+    log_step("Preparing AMC...")
+    dataset = load_dataset("felixZzz/math_eval_suite-amc", split="test")
+
+    rows = []
+    for sample in dataset:
+        problem = str(find_first(sample, ["problem", "question"])).strip()
+        answer = format_scalar_answer(find_first(sample, ["answer", "final_answer", "solution"]))
+        if not problem or not answer:
+            continue
+        rows.append({"prompt": problem, "answer": answer})
+        if val_limit is not None and len(rows) >= val_limit:
+            break
+
+    save_parquet(rows, output_dir / "amc_val.parquet")
+
+
+def prepare_math500(output_dir: Path, val_limit: int | None = None) -> None:
+    log_step("Preparing MATH-500...")
+    dataset = load_dataset("HuggingFaceH4/MATH-500", split="test")
+
+    rows = []
+    for sample in dataset:
+        problem = str(find_first(sample, ["problem", "question"])).strip()
+        answer = str(find_first(sample, ["answer", "final_answer"])).strip()
+        if not problem or not answer:
+            continue
+        rows.append({"prompt": problem, "answer": answer})
+        if val_limit is not None and len(rows) >= val_limit:
+            break
+
+    save_parquet(rows, output_dir / "math500_val.parquet")
+
+
+def prepare_minerva(output_dir: Path, val_limit: int | None = None) -> None:
+    log_step("Preparing Minerva Math...")
+    dataset = load_dataset("svc-huggingface/minerva-math", split="test")
+
+    rows = []
+    skipped = 0
+    for sample in dataset:
+        problem = str(find_first(sample, ["problem", "question"])).strip()
+        answer = extract_last_boxed_answer(str(find_first(sample, ["solution"])))
+        if not problem or not answer:
+            skipped += 1
+            continue
+        rows.append({"prompt": problem, "answer": answer.strip()})
+        if val_limit is not None and len(rows) >= val_limit:
+            break
+
+    if skipped:
+        log_step(f"Minerva Math: skipped {skipped} samples without a boxed final answer")
+    save_parquet(rows, output_dir / "minerva_val.parquet")
+
+
+def prepare_olympiadbench(output_dir: Path, val_limit: int | None = None) -> None:
+    log_step("Preparing OlympiadBench...")
+    dataset = load_dataset("math-ai/olympiadbench", split="test")
+
+    rows = []
+    skipped = 0
+    for sample in dataset:
+        if sample.get("language") != "English":
+            skipped += 1
+            continue
+        if sample.get("modality") != "Text-only":
+            skipped += 1
+            continue
+        if sample.get("subject") != "Math":
+            skipped += 1
+            continue
+
+        final_answer = sample.get("final_answer")
+        if isinstance(final_answer, list):
+            if sample.get("is_multiple_answer") or len(final_answer) != 1:
+                skipped += 1
+                continue
+            answer = str(final_answer[0]).strip()
+        elif final_answer is None:
+            skipped += 1
+            continue
+        else:
+            answer = str(final_answer).strip()
+
+        question = str(find_first(sample, ["question", "problem"])).strip()
+        if not question or not answer:
+            skipped += 1
+            continue
+
+        rows.append({"prompt": question, "answer": answer})
+        if val_limit is not None and len(rows) >= val_limit:
+            break
+
+    if skipped:
+        log_step(f"OlympiadBench: skipped {skipped} samples that do not fit single-answer text-only math evaluation")
+    save_parquet(rows, output_dir / "olympiadbench_val.parquet")
+
+
 def build_mbpp_prompt(text: str) -> str:
     return "\n\n".join(
         [
@@ -513,6 +746,30 @@ def prepare_humaneval(output_dir: Path, val_limit: int | None = None) -> None:
     save_parquet(rows, output_dir / "humaneval_val.parquet")
 
 
+def prepare_humanevalplus(output_dir: Path, val_limit: int | None = None) -> None:
+    log_step("Preparing HumanEval+...")
+    dataset = load_dataset("evalplus/humanevalplus", split="test")
+
+    rows = []
+    for sample in dataset:
+        answer = {
+            "test_type": "humaneval",
+            "prompt_prefix": sample["prompt"],
+            "test_code": sample["test"],
+            "entry_point": sample["entry_point"],
+        }
+        rows.append(
+            {
+                "prompt": build_humaneval_prompt(sample["prompt"]),
+                "answer": json.dumps(answer, ensure_ascii=False),
+            }
+        )
+        if val_limit is not None and len(rows) >= val_limit:
+            break
+
+    save_parquet(rows, output_dir / "humanevalplus_val.parquet")
+
+
 def prepare_livecodebench(output_dir: Path, val_limit: int | None = None) -> list[dict]:
     log_step("Preparing LiveCodeBench...")
     data_files = [
@@ -557,6 +814,60 @@ def prepare_livecodebench(output_dir: Path, val_limit: int | None = None) -> lis
     return rows
 
 
+def prepare_taco(output_dir: Path, test_limit: int | None = None) -> list[dict]:
+    log_step("Preparing TACO...")
+    snapshot_dir = download_hf_dataset_snapshot("BAAI/TACO", ["ALL/test-*.parquet", "README.md"])
+    dataset = load_dataset(
+        "parquet",
+        data_files={"test": find_local_files(snapshot_dir / "ALL", "test-*.parquet")},
+        split="test",
+    )
+
+    rows = []
+    skipped = 0
+    for sample in dataset:
+        raw_tests = sample.get("input_output")
+        if not raw_tests:
+            skipped += 1
+            continue
+
+        try:
+            test_spec = json.loads(raw_tests) if isinstance(raw_tests, str) else raw_tests
+        except Exception:
+            skipped += 1
+            continue
+
+        if not isinstance(test_spec, dict) or not test_spec.get("inputs") or not test_spec.get("outputs"):
+            skipped += 1
+            continue
+
+        question = sample.get("question") or sample.get("problem")
+        if not question:
+            skipped += 1
+            continue
+
+        answer = {
+            "test_type": "input_output",
+            "inputs": test_spec["inputs"],
+            "outputs": test_spec["outputs"],
+            "fn_name": test_spec.get("fn_name"),
+        }
+        rows.append(
+            {
+                "prompt": build_code_prompt(str(question), sample.get("starter_code") or None),
+                "answer": json.dumps(answer, ensure_ascii=False),
+            }
+        )
+
+        if test_limit is not None and len(rows) >= test_limit:
+            break
+
+    if skipped:
+        log_step(f"TACO: skipped {skipped} samples without usable tests")
+    save_parquet(rows, output_dir / "taco_test.parquet")
+    return rows
+
+
 def prepare_coding_mix(output_dir: Path, mbpp_train: list[dict], apps_train: list[dict]) -> None:
     log_step("Preparing coding train mix...")
     coding_train_rows = mbpp_train + apps_train
@@ -566,29 +877,79 @@ def prepare_coding_mix(output_dir: Path, mbpp_train: list[dict], apps_train: lis
 def main() -> None:
     args = parse_args()
     output_dir = ensure_output_dir(args.output_dir)
-    prepare_deepscaler(
-        output_dir,
-        train_limit=args.deepscaler_train_limit,
-        val_limit=args.deepscaler_val_limit,
-    )
-    prepare_deepcoder(
-        output_dir,
-        train_limit=args.deepcoder_train_limit,
-        val_limit=args.deepcoder_val_limit,
-        train_configs=args.deepcoder_train_configs,
-        val_configs=args.deepcoder_val_configs,
-    )
-    prepare_aime25(output_dir, val_limit=args.aime25_val_limit)
-    mbpp_train, _ = prepare_mbpp(output_dir, test_limit=args.mbpp_test_limit)
-    apps_train, _ = prepare_apps(
-        output_dir,
-        train_limit=args.apps_train_limit,
-        test_limit=args.apps_test_limit,
-        allowed_difficulties=args.apps_difficulties,
-    )
-    prepare_humaneval(output_dir, val_limit=args.humaneval_val_limit)
-    prepare_livecodebench(output_dir, val_limit=args.livecodebench_val_limit)
-    prepare_coding_mix(output_dir, mbpp_train=mbpp_train, apps_train=apps_train)
+    selected_datasets = parse_dataset_names(args.datasets)
+
+    mbpp_train: list[dict] | None = None
+    apps_train: list[dict] | None = None
+
+    if "deepscaler" in selected_datasets:
+        prepare_deepscaler(
+            output_dir,
+            train_limit=args.deepscaler_train_limit,
+            val_limit=args.deepscaler_val_limit,
+        )
+
+    if "deepcoder" in selected_datasets:
+        prepare_deepcoder(
+            output_dir,
+            train_limit=args.deepcoder_train_limit,
+            val_limit=args.deepcoder_val_limit,
+            train_configs=args.deepcoder_train_configs,
+            val_configs=args.deepcoder_val_configs,
+        )
+
+    if "aime24" in selected_datasets:
+        prepare_aime24(output_dir, val_limit=args.aime24_val_limit)
+
+    if "aime25" in selected_datasets:
+        prepare_aime25(output_dir, val_limit=args.aime25_val_limit)
+
+    if "amc" in selected_datasets:
+        prepare_amc(output_dir, val_limit=args.amc_val_limit)
+
+    if "math500" in selected_datasets:
+        prepare_math500(output_dir, val_limit=args.math500_val_limit)
+
+    if "minerva" in selected_datasets:
+        prepare_minerva(output_dir, val_limit=args.minerva_val_limit)
+
+    if "olympiadbench" in selected_datasets:
+        prepare_olympiadbench(output_dir, val_limit=args.olympiadbench_val_limit)
+
+    if "mbpp" in selected_datasets or "coding_train_mix" in selected_datasets:
+        mbpp_train, _ = prepare_mbpp(output_dir, test_limit=args.mbpp_test_limit)
+
+    if "apps" in selected_datasets or "coding_train_mix" in selected_datasets:
+        apps_train, _ = prepare_apps(
+            output_dir,
+            train_limit=args.apps_train_limit,
+            test_limit=args.apps_test_limit,
+            allowed_difficulties=args.apps_difficulties,
+        )
+
+    if "humaneval" in selected_datasets:
+        prepare_humaneval(output_dir, val_limit=args.humaneval_val_limit)
+
+    if "humanevalplus" in selected_datasets:
+        prepare_humanevalplus(output_dir, val_limit=args.humanevalplus_val_limit)
+
+    if "livecodebench" in selected_datasets:
+        prepare_livecodebench(output_dir, val_limit=args.livecodebench_val_limit)
+
+    if "taco" in selected_datasets:
+        prepare_taco(output_dir, test_limit=args.taco_test_limit)
+
+    if "coding_train_mix" in selected_datasets:
+        if mbpp_train is None:
+            mbpp_train, _ = prepare_mbpp(output_dir, test_limit=args.mbpp_test_limit)
+        if apps_train is None:
+            apps_train, _ = prepare_apps(
+                output_dir,
+                train_limit=args.apps_train_limit,
+                test_limit=args.apps_test_limit,
+                allowed_difficulties=args.apps_difficulties,
+            )
+        prepare_coding_mix(output_dir, mbpp_train=mbpp_train, apps_train=apps_train)
 
 
 if __name__ == "__main__":
